@@ -19,14 +19,13 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
+import math
 
 import tensorflow as tf
-from tensorflow_probability.python.distributions import beta as beta_lib
-from tensorflow_probability.python.distributions import distribution
+from tensorflow_probability.python.distributions import distribution, MultivariateNormalFullCovariance
 from tensorflow_probability.python.distributions import seed_stream
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import reparameterization
-
 
 __all__ = ['Bingham']
 
@@ -44,6 +43,8 @@ class Bingham(distribution.Distribution):
                  name='Bingham'):
         """Creates a new  `Bingham` instance.
 
+        Only implemented for D =3 for now
+
         Args:
             rotation: Floating-point `Tensor` of shape [B1, ... Bn, D, D]
                 Orthogonal matrix that describes rotation
@@ -60,11 +61,15 @@ class Bingham(distribution.Distribution):
             concentration = tf.convert_to_tensor(
                         value=concentration, name='concentration', dtype=dtype)
 
-            # Checks should  verify that rotation is orthogonal, last c is 0, ext
+            # Checks should verify that rotation is orthogonal, last c is 0, ext
             assertions = []
             with tf.control_dependencies(assertions):
                 self._rotation = tf.identity(rotation)
                 self._concentration = tf.identity(concentration)
+
+            # Compute sphere surface area
+            # TODO: generalize to different dimensions
+            self._s2 = 2. * math.pi**((3.)/2)/math.gamma((3.)/2);
 
             # For now, not reparameterized
             reparameterization_type = reparameterization.NOT_REPARAMETERIZED
@@ -90,7 +95,7 @@ class Bingham(distribution.Distribution):
     def _batch_shape_tensor(self):
         return tf.broadcast_dynamic_shape(
             tf.shape(input=self.rotation)[:-2],
-            tf.shape(input=self.concentration[:-1]))
+            tf.shape(input=self.concentration)[:-1])
 
     def _batch_shape(self):
         return tf.broadcast_static_shape(
@@ -116,8 +121,7 @@ class Bingham(distribution.Distribution):
     def _log_normalization(self):
         """Computes the log-normalizer of the distribution."""
         # This is a formula that only works for  the d=2
-        s2 = 1 # should be BinghamDistribution.S2
-        F = tf.exp(self.concentration[...,-1]) * s2 * tf.math.bessel_i0e((self.concentration[...,0] - self.concentration[...,1])/2) * tf.exp((self.concentration[...,0] - self.concentration[...,1]));
+        F = tf.exp(self.concentration[...,-1]) * self._s2 * tf.math.bessel_i0e((self.concentration[...,0] - self.concentration[...,1])/2) * tf.exp((self.concentration[...,0] - self.concentration[...,1]));
         return F
 
     def _maybe_assert_valid_sample(self, samples):
@@ -136,3 +140,79 @@ class Bingham(distribution.Distribution):
                          '`self.concentration`')),
             ]):
             return tf.identity(samples)
+
+    def _sample_n(self, n, seed=None, precision=1e-6):
+        """ Sampling procedure based on Kent's algorithm
+        """
+        seed = seed_stream.SeedStream(seed, salt='bingham')
+        event_dim = ( self.event_shape[0].value or
+            self._event_shape_tensor()[0])
+
+        batch_size = self._batch_shape_tensor()
+        sample_batch_shape = tf.concat([[n]], axis=0)
+        dim = tf.cast(event_dim, self.dtype)
+
+        q = dim
+        A = - tf.matmul(self.rotation, tf.matmul( tf.linalg.diag(self.concentration), self.rotation, transpose_b=True))
+
+        # Implement root finding algorithm to compute b
+        def f(x):
+            fx = tf.reduce_sum( 1./(tf.expand_dims(x,axis=-1) - 2.*self.concentration) ,axis=-1) - 1.
+            dx = tf.gradients(fx, x)
+            return tf.reshape(fx / dx, [-1])
+
+        def newton_raphson_body(x, x_0, p, k):
+            x_0 = tf.identity(x)
+            x = x_0 - f(x_0)
+            k = tf.add(k, 1)
+            return [x, x_0, p, k]
+
+        def newton_raphson_condition(x, x_0, p, k):
+            return tf.reduce_max(tf.abs(x - x_0)) > p
+
+        x0 = tf.ones(batch_size, dtype=self.dtype)
+        x  = x0 - f(x0)
+        p  = tf.constant(name="precision", shape=[], dtype=self.dtype, value=precision)
+        k  = tf.zeros(shape=[], dtype=tf.int64)
+        loop = tf.while_loop(newton_raphson_condition,
+                             newton_raphson_body, loop_vars=[x, x0, p, k])
+        # Extract the root
+        b = loop[0]
+        Omega = tf.eye(3) + 2*A/tf.expand_dims(tf.expand_dims(b,axis=-1),axis=-1)
+        Mbstar = tf.exp(-(q - b)/2) *(q / b)**(q / 2.)
+
+        # Build angular central Gaussian
+        mvnrnd = MultivariateNormalFullCovariance(loc=tf.zeros(3, dtype=self.dtype),
+                                                  covariance_matrix=tf.linalg.inv(Omega))
+
+        w = tf.zeros(batch_size*n*event_dim, dtype=self.dtype)
+        w = tf.reshape(w, [-1, event_dim])
+        should_continue = tf.ones(n * batch_size, dtype=tf.bool)
+
+        # Sampling loop
+        def cond_fn(w, should_continue):
+            del w
+            return tf.reduce_any(input_tensor=should_continue)
+
+        def body_fn(w, should_continue):
+            # Draw from angular central Gaussian
+            y = mvnrnd.sample(sample_shape=sample_batch_shape, seed=seed())
+            x = tf.nn.l2_normalize(y, axis=-1)
+
+            # Update the samples where needed
+            w = tf.where(should_continue, tf.reshape(x, [-1, event_dim]), w)
+            w = tf.debugging.check_numerics(w, 'w')
+
+            y =  tf.transpose(x, [1,2,0])
+            a = tf.transpose(tf.reduce_sum(y*tf.matmul(A,y),axis=1), [1,0])
+            b = tf.transpose(tf.reduce_sum(y*tf.matmul(Omega,y),axis=1), [1,0])
+            c = tf.random.uniform(a.shape, seed=seed(), dtype=self.dtype) < tf.exp(-a) / (Mbstar * b**(q/2.))
+            should_continue = tf.logical_and(
+                        should_continue, tf.reshape(c, [-1]))
+            return w, should_continue
+
+
+        samples = tf.while_loop(cond=cond_fn, body=body_fn, loop_vars=(w, should_continue))[0]
+
+        samples = tf.reshape(samples, [n, -1, event_dim])
+        return samples
