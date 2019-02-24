@@ -206,9 +206,8 @@ class Bingham(distribution.Distribution):
             y =  tf.transpose(x, [1,2,0])
             a = tf.transpose(tf.reduce_sum(y*tf.matmul(A,y),axis=1), [1,0])
             b = tf.transpose(tf.reduce_sum(y*tf.matmul(Omega,y),axis=1), [1,0])
-            c = tf.random.uniform(a.shape, seed=seed(), dtype=self.dtype) < tf.exp(-a) / (Mbstar * b**(q/2.))
-            should_continue = tf.logical_and(
-                        should_continue, tf.reshape(c, [-1]))
+            c = tf.random.uniform(batch_size*sample_batch_shape, seed=seed(), dtype=self.dtype) <  tf.reshape(tf.exp(-a) / (Mbstar * b**(q/2.)), [-1])
+            should_continue = tf.logical_and(should_continue, c)
             return w, should_continue
 
 
