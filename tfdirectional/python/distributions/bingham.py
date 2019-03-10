@@ -120,8 +120,44 @@ class Bingham(distribution.Distribution):
 
     def _log_normalization(self):
         """Computes the log-normalizer of the distribution."""
-        # This is a formula that only works for  the d=2
-        F = tf.exp(self.concentration[...,-1]) * self._s2 * tf.math.bessel_i0e((self.concentration[...,0] - self.concentration[...,1])/2) * tf.exp((self.concentration[...,0] - self.concentration[...,1]));
+        # This is a formula that only works for  the d=2, which is useless for us :-/
+        #F = tf.exp(self.concentration[...,-1]) * self._s2 * tf.math.bessel_i0e((self.concentration[...,0] - self.concentration[...,1])/2) * tf.exp((self.concentration[...,0] - self.concentration[...,1]));
+
+        # Compute normalization constant using the saddle point method
+        # Define the derivatives of the cumulant generative function
+        def K1(t):
+             return tf.reduce_sum(0.5 / (tf.sqrt(-self.concentration) - t), axis=-1)
+        def K2(t):
+             return tf.reduce_sum(0.5 / (tf.sqrt(-self.concentration) - t)**2, axis=-1)
+        def K3(t):
+             return tf.reduce_sum(1. / (tf.sqrt(-self.concentration) - t)**3, axis=-1)
+        def K4(t):
+             return tf.reduce_sum(3. / (tf.sqrt(-self.concentration) - t)**4, axis=-1)
+
+        # Step 1: Finding the root tstar
+        def f(x):
+            fx = K1(x) - 1.
+            dx = tf.gradients(fx, x)
+            return tf.reshape(fx / dx, [-1])
+
+        def newton_raphson_body(x, x_0, p, k):
+            x_0 = tf.identity(x)
+            x = x_0 - f(x_0)
+            k = tf.add(k, 1)
+            return [x, x_0, p, k]
+
+        def newton_raphson_condition(x, x_0, p, k):
+            return tf.reduce_max(tf.abs(x - x_0)) > p
+
+        x0 = tf.ones(batch_size, dtype=self.dtype) * minEl-0.5
+        x  = x0 - f(x0)
+        p  = tf.constant(name="precision", shape=[], dtype=self.dtype, value=precision)
+        k  = tf.zeros(shape=[], dtype=tf.int64)
+        loop = tf.while_loop(newton_raphson_condition,
+                             newton_raphson_body, loop_vars=[x, x0, p, k])
+
+
+
         return F
 
     def _maybe_assert_valid_sample(self, samples):
